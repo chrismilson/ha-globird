@@ -10,11 +10,12 @@ from homeassistant import config_entries
 from homeassistant.config_entries import ConfigFlowResult
 from homeassistant.helpers import selector
 
-from .client import GloBirdAuthError, GloBirdCaptchaRequired, GloBirdClient
+from .client import GloBirdAuthError, GloBirdCaptchaRequired, GloBirdClient, service_id
 from .const import (
     CONF_DAILY_POLL_START_TIME,
     CONF_EMAIL,
     CONF_PASSWORD,
+    CONF_REGISTER_RATES,
     DEFAULT_DAILY_POLL_START_TIME,
     DOMAIN,
 )
@@ -216,29 +217,142 @@ class GloBirdConfigFlow(  # pyright: ignore[reportGeneralTypeIssues, reportCallI
         )
 
 
+def _register_label(register: dict[str, Any]) -> str:
+    """Return a readable label for a usage register."""
+    parts = [
+        str(register.get("suffix") or "").strip(),
+        str(register.get("chargeType") or "").strip(),
+    ]
+    label = " ".join(part for part in parts if part)
+    return label or str(register.get("slug") or "register")
+
+
 class GloBirdOptionsFlow(config_entries.OptionsFlowWithReload):
     """Handle GloBird options."""
+
+    def __init__(self) -> None:
+        """Initialize the options flow."""
+        super().__init__()
+        self._stored_rates: dict[str, float] = {}
+
+    def _register_rate_fields(
+        self, entry: config_entries.ConfigEntry
+    ) -> dict[str, Any]:
+        """Return per-register rate field configs keyed by ``service_id:slug``.
+
+        Only electricity registers that get their own usage statistic
+        (``register_sensor``) and are imported can be priced: the portal's
+        cost rows have no register split, so their cost is computed from the
+        register's daily usage and the configured rate.
+        """
+        coordinator = getattr(entry, "runtime_data", None)
+        data = getattr(coordinator, "data", None)
+        if not isinstance(data, dict):
+            return {}
+        service_data = data.get("service_data")
+        if not isinstance(service_data, dict):
+            return {}
+
+        services = data.get("services")
+        electricity = [
+            service
+            for service in (services if isinstance(services, list) else [])
+            if isinstance(service, dict)
+            and "gas" not in str(service.get("serviceType") or "").lower()
+        ]
+        show_sites = len(electricity) > 1
+        fields: dict[str, Any] = {}
+        for service in electricity:
+            sid = service_id(service)
+            detail = service_data.get(sid)
+            if not isinstance(detail, dict):
+                continue
+            summary = detail.get("usage_summary")
+            registers = (
+                summary.get("registers") if isinstance(summary, dict) else None
+            ) or []
+            site = str(
+                service.get("siteIdentifier") or service.get("accountServiceId") or ""
+            ).strip()
+            for register in registers:
+                if not isinstance(register, dict):
+                    continue
+                if not register.get("register_sensor"):
+                    continue
+                if register.get("direction") != "import":
+                    continue
+                slug = str(register.get("slug") or "").strip()
+                if not slug:
+                    continue
+                label = _register_label(register)
+                if show_sites and site:
+                    label = f"{label} ({site})"
+                key = f"{sid}:{slug}"
+                field: dict[str, Any] = {
+                    "label": f"{label} rate (AUD/kWh)",
+                    "selector": selector.NumberSelector(
+                        selector.NumberSelectorConfig(
+                            min=-100,
+                            max=1000,
+                            step=0.0001,
+                            unit_of_measurement="AUD/kWh",
+                            mode=selector.NumberSelectorMode.BOX,
+                        )
+                    ),
+                    "required": False,
+                }
+                if key in self._stored_rates:
+                    field["default"] = self._stored_rates[key]
+                fields[key] = field
+        return fields
 
     async def async_step_init(
         self, user_input: dict[str, Any] | None = None
     ) -> ConfigFlowResult:
         """Manage integration options."""
         if user_input is not None:
-            return self.async_create_entry(title="", data=user_input)
+            data = dict(user_input)
+            submitted = data.get(CONF_REGISTER_RATES)
+            if isinstance(submitted, dict):
+                for key, value in submitted.items():
+                    if not isinstance(key, str) or not key:
+                        continue
+                    try:
+                        rate = float(value)
+                    except (TypeError, ValueError):
+                        continue
+                    self._stored_rates[key] = rate
+            data[CONF_REGISTER_RATES] = self._stored_rates
+            return self.async_create_entry(title="", data=data)
 
-        current_time = self.config_entry.options.get(
+        entry = self.config_entry
+        current_time = entry.options.get(
             CONF_DAILY_POLL_START_TIME,
             DEFAULT_DAILY_POLL_START_TIME,
         )
+        stored_rates = entry.options.get(CONF_REGISTER_RATES)
+        self._stored_rates = (
+            {
+                str(key): float(value)
+                for key, value in stored_rates.items()
+                if isinstance(value, (int, float))
+            }
+            if isinstance(stored_rates, dict)
+            else {}
+        )
+
+        schema: dict[Any, Any] = {
+            vol.Required(
+                CONF_DAILY_POLL_START_TIME,
+                default=current_time,
+            ): selector.TimeSelector(),
+        }
+        if rate_fields := self._register_rate_fields(entry):
+            schema[vol.Optional(CONF_REGISTER_RATES)] = selector.ObjectSelector(
+                selector.ObjectSelectorConfig(fields=rate_fields)
+            )
 
         return self.async_show_form(
             step_id="init",
-            data_schema=vol.Schema(
-                {
-                    vol.Required(
-                        CONF_DAILY_POLL_START_TIME,
-                        default=current_time,
-                    ): selector.TimeSelector(),
-                }
-            ),
+            data_schema=vol.Schema(schema),
         )

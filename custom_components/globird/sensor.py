@@ -42,6 +42,7 @@ from homeassistant.util.unit_conversion import EnergyConverter, VolumeConverter
 from .client import (
     ATTR_RECENT_ROW_LIMIT,
     USAGE_CLASS_CONTROLLED_LOAD,
+    USAGE_CLASS_GENERAL_IMPORT,
     USAGE_CLASS_TRACKING,
     build_billing_period_projection,
     build_latest_data_status,
@@ -49,7 +50,7 @@ from .client import (
     service_id,
     usage_attributes,
 )
-from .const import DOMAIN
+from .const import CONF_REGISTER_RATES, DOMAIN
 from .coordinator import GloBirdCoordinator
 
 PARALLEL_UPDATES = 0
@@ -441,6 +442,7 @@ def _build_daily_cumulative_statistics(
     value_key: str,
     tzinfo: Any,
     stored_sum: float | None = None,
+    rate: float | None = None,
 ) -> list[StatisticData]:
     """Build cumulative daily statistics for Energy Dashboard consumption or cost.
 
@@ -451,6 +453,11 @@ def _build_daily_cumulative_statistics(
     oldest day. Without it the first row's ``sum`` is its own day value, so
     first-day usage still counts on the first import. Rows that are already
     wrong outside the window are not repaired.
+
+    When ``rate`` is given, each day's value is multiplied by it first, so
+    the same builder produces priced cost series from usage rows. A rate
+    change rewrites the current window at the new rate; older stored rows
+    keep their old rate, and the sum continues from them without a jump.
     """
     by_day: dict[date, float] = {}
     for row in daily_rows:
@@ -468,7 +475,8 @@ def _build_daily_cumulative_statistics(
     cumulative_sum = stored_sum or 0.0
     result: list[StatisticData] = []
     for day in sorted(by_day):
-        day_value = round(by_day[day], 3)
+        raw = by_day[day] if rate is None else by_day[day] * rate
+        day_value = round(raw, 3)
         cumulative_sum = round(cumulative_sum + day_value, 3)
         result.append(
             StatisticData(
@@ -955,6 +963,22 @@ class GloBirdServiceBaseSensor(GloBirdBaseSensor):
         detail = service_data.get(self._service_id)
         return detail if isinstance(detail, dict) else {}
 
+    def _register_rates(self) -> dict[str, float]:
+        """Return the configured per-register rates keyed by ``service_id:slug``."""
+        options = getattr(self._config_entry, "options", None)
+        rates = options.get(CONF_REGISTER_RATES) if isinstance(options, dict) else None
+        if not isinstance(rates, dict):
+            return {}
+        result: dict[str, float] = {}
+        for key, value in rates.items():
+            if isinstance(key, str) and isinstance(value, (int, float)):
+                result[key] = float(value)
+        return result
+
+    def _register_rate(self, slug: str) -> float | None:
+        """Return the configured AUD/kWh rate for one of this service's registers."""
+        return self._register_rates().get(f"{self._service_id}:{slug}")
+
     def _service_attrs(self) -> dict[str, Any]:
         """Return service metadata attributes."""
         detail = self._service_detail()
@@ -1094,11 +1118,16 @@ class GloBirdServiceBaseSensor(GloBirdBaseSensor):
         unit_class: str | None,
         statistic_id: str | None = None,
         name: str | None = None,
+        rate: float | None = None,
+        unit_of_measurement: str | None = None,
     ) -> None:
         """Upload daily cumulative external statistics for the Home Assistant Energy Dashboard.
 
         ``statistic_id`` and ``name`` default to this sensor's own statistic;
         sensors pass them to import breakdown series, such as one per register.
+        When ``rate`` is given, each day's value is priced by it before import,
+        and ``unit_of_measurement`` may override the sensor's own unit (usage
+        rows priced into AUD cost series).
         """
         if not isinstance(daily_rows, list) or not daily_rows:
             return
@@ -1117,6 +1146,7 @@ class GloBirdServiceBaseSensor(GloBirdBaseSensor):
             date_key=date_key,
             value_key=value_key,
             tzinfo=tzinfo,
+            rate=rate,
         )
         if not statistics:
             return
@@ -1142,6 +1172,7 @@ class GloBirdServiceBaseSensor(GloBirdBaseSensor):
                 value_key=value_key,
                 tzinfo=tzinfo,
                 stored_sum=stored_rows[-1].get("sum"),
+                rate=rate,
             )
 
         metadata = StatisticMetaData(
@@ -1152,7 +1183,9 @@ class GloBirdServiceBaseSensor(GloBirdBaseSensor):
             source=DOMAIN,
             statistic_id=statistic_id,
             unit_class=unit_class,
-            unit_of_measurement=self._attr_native_unit_of_measurement,
+            unit_of_measurement=(
+                unit_of_measurement or self._attr_native_unit_of_measurement
+            ),
         )
         try:
             add_result: Any = async_add_external_statistics(
@@ -1668,7 +1701,71 @@ class GloBirdUsageTotalSensor(GloBirdDailyStatisticsSensor):
             value_key="usage",
             unit_class=EnergyConverter.UNIT_CLASS,
         )
+        await self._async_upload_usage_cost_statistics()
         await self._async_upload_tracking_registers("import")
+
+    def _usage_rates_complete(self) -> bool:
+        """Return whether every general-import register has a configured rate."""
+        summary = self._service_detail().get("usage_summary") or {}
+        registers = [
+            register
+            for register in summary.get("registers") or []
+            if isinstance(register, dict)
+            and register.get("usage_class") == USAGE_CLASS_GENERAL_IMPORT
+        ]
+        return bool(registers) and all(
+            self._register_rate(str(register.get("slug") or "")) is not None
+            for register in registers
+        )
+
+    async def _async_upload_usage_cost_statistics(self) -> None:
+        """Import a time-of-use-aware daily cost series for the usage total.
+
+        Days are priced register by register with the configured rates, so
+        the sums match the per-register cost statistics instead of the
+        portal's blended USAGE category. Needs a rate for every
+        general-import register; otherwise nothing is imported and any
+        previously stored series is left as-is.
+        """
+        if not self._usage_rates_complete():
+            return
+        summary = self._service_detail().get("usage_summary") or {}
+        daily_cost: dict[str, float] = {}
+        for register in summary.get("registers") or []:
+            if not isinstance(register, dict) or (
+                register.get("usage_class") != USAGE_CLASS_GENERAL_IMPORT
+            ):
+                continue
+            rate = self._register_rate(str(register.get("slug") or ""))
+            if rate is None:
+                continue
+            for row in register.get("daily") or []:
+                if not isinstance(row, dict):
+                    continue
+                day = row.get("readDate")
+                usage = row.get("usage")
+                if not isinstance(day, str) or not isinstance(usage, (int, float)):
+                    continue
+                # Sum the same rounded amounts the register series stores so
+                # the combined total always equals the register costs' sum.
+                daily_cost[day] = daily_cost.get(day, 0.0) + round(
+                    rate * float(usage), 3
+                )
+        if not daily_cost:
+            return
+        priced_rows = [
+            {"readDate": day, "amount": round(amount, 3)}
+            for day, amount in sorted(daily_cost.items())
+        ]
+        await self._async_upload_daily_external_statistics(
+            priced_rows,
+            date_key="readDate",
+            value_key="amount",
+            unit_class=None,
+            statistic_id=f"{self._external_statistic_id()}_cost",
+            name=f"{self._attr_name} Cost",
+            unit_of_measurement=CURRENCY_AUD,
+        )
 
     @property
     def native_value(self) -> Any:
@@ -1684,6 +1781,8 @@ class GloBirdUsageTotalSensor(GloBirdDailyStatisticsSensor):
         summary = self._service_detail().get("usage_summary") or {}
         attrs.update(usage_attributes(summary, direction="import"))
         attrs["register_statistics"] = self._register_statistics("import")
+        if self._usage_rates_complete():
+            attrs["usage_cost_statistic_id"] = f"{self._external_statistic_id()}_cost"
         return attrs
 
 
@@ -1925,15 +2024,29 @@ class GloBirdUsageRegisterSensor(GloBirdDailyStatisticsSensor):
         return bool(super().available) and self._register() is not None
 
     async def _async_upload_statistics(self) -> None:
-        """Upload this register's daily usage statistics."""
+        """Upload this register's daily usage, and cost when a rate is set."""
         register = self._register()
         if register is None:
             return
+        daily = register.get("daily") or []
         await self._async_upload_daily_external_statistics(
-            register.get("daily") or [],
+            daily,
             date_key="readDate",
             value_key="usage",
             unit_class=EnergyConverter.UNIT_CLASS,
+        )
+        rate = self._register_rate(self._slug)
+        if rate is None:
+            return
+        await self._async_upload_daily_external_statistics(
+            daily,
+            date_key="readDate",
+            value_key="usage",
+            unit_class=None,
+            statistic_id=f"{self._external_statistic_id()}_cost",
+            name=f"{self._attr_name} Cost",
+            rate=rate,
+            unit_of_measurement=CURRENCY_AUD,
         )
 
     @property
@@ -1964,6 +2077,10 @@ class GloBirdUsageRegisterSensor(GloBirdDailyStatisticsSensor):
                 "daily_count": len(daily_rows),
             }
         )
+        rate = self._register_rate(self._slug)
+        if rate is not None:
+            attrs["cost_rate"] = rate
+            attrs["cost_statistic_id"] = f"{self._external_statistic_id()}_cost"
         return attrs
 
 
