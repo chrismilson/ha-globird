@@ -6,6 +6,10 @@ This project uses Home Assistant's calendar versioning scheme (`YYYY.M.P`, for e
 
 ## [Unreleased]
 
+### Added
+
+- Per-register cost statistics for the Energy Dashboard. Set an AUD/kWh rate per time-of-use register in the integration options, and the integration imports a priced daily cost statistic for each register (`globird:<entry>_service_<id>_register_<register>_cost`) plus one for the usage total (`globird:…_usage_total_cost`) once every general-import register has a rate. The portal's cost rows carry no register split, so these are computed from each register's daily usage — the same multiplication the bill does. The register sensors expose `cost_rate`/`cost_statistic_id` and Recent Usage Total exposes `usage_cost_statistic_id` for easy lookup.
+
 ### Changed
 
 - The HA Next release and development checks use the official pytest plugin matching the Core version under test ([#41](https://github.com/tinkerologie/ha-globird/issues/41)).

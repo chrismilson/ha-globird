@@ -47,6 +47,20 @@ class Required:
         return hash((self.key, self.default))
 
 
+class Optional:
+    """Minimal optional field marker."""
+
+    def __init__(self, key: str, default: Any | None = None) -> None:
+        self.key = key
+        self.default = default
+
+    def __repr__(self) -> str:
+        return self.key
+
+    def __hash__(self) -> int:
+        return hash((self.key, self.default))
+
+
 class ConfigFlow:
     """Minimal stand-in for Home Assistant's config flow base."""
 
@@ -108,9 +122,11 @@ class ConfigEntry:
         self,
         options: dict[str, Any] | None = None,
         data: dict[str, Any] | None = None,
+        runtime_data: Any = None,
     ) -> None:
         self.options = options or {}
         self.data = data or {}
+        self.runtime_data = runtime_data
 
 
 class TextSelector:
@@ -124,6 +140,20 @@ class TimeSelector:
     """Minimal time selector."""
 
 
+class NumberSelector:
+    """Minimal number selector."""
+
+    def __init__(self, _config: Any) -> None:
+        return None
+
+
+class ObjectSelector:
+    """Minimal object selector that keeps its field configuration."""
+
+    def __init__(self, config: Any) -> None:
+        self.config = config
+
+
 config_entries.ConfigEntry = ConfigEntry
 config_entries.ConfigFlow = ConfigFlow
 config_entries.ConfigFlowResult = dict[str, Any]
@@ -131,11 +161,17 @@ config_entries.OptionsFlow = OptionsFlow
 config_entries.OptionsFlowWithReload = OptionsFlowWithReload
 data_entry_flow.FlowResult = dict[str, Any]
 voluptuous.Required = Required
+voluptuous.Optional = Optional
 voluptuous.Schema = Schema
 selector.TextSelector = TextSelector
 selector.TextSelectorConfig = lambda **kwargs: kwargs
 selector.TextSelectorType = types.SimpleNamespace(PASSWORD="password")
 selector.TimeSelector = TimeSelector
+selector.NumberSelector = NumberSelector
+selector.NumberSelectorConfig = lambda **kwargs: kwargs
+selector.NumberSelectorMode = types.SimpleNamespace(BOX="box")
+selector.ObjectSelector = ObjectSelector
+selector.ObjectSelectorConfig = lambda **kwargs: kwargs
 helpers.selector = selector
 util_logging.log_exception = lambda *_args, **_kwargs: None
 util.logging = util_logging
@@ -186,8 +222,143 @@ def test_options_flow_saves_daily_poll_start_time() -> None:
     assert result == {
         "type": "create_entry",
         "title": "",
-        "data": {"daily_poll_start_time": "03:00"},
+        "data": {
+            "daily_poll_start_time": "03:00",
+            "register_rates": {},
+        },
     }
+
+
+def _rate_field_coordinator() -> Any:
+    """Return a coordinator whose data holds one TOU electricity service."""
+
+    class Coordinator:
+        data = {
+            "services": [
+                {
+                    "accountServiceId": 950191,
+                    "serviceType": "Power",
+                    "siteIdentifier": "NMI-1",
+                },
+                {
+                    "accountServiceId": 2,
+                    "serviceType": "Gas",
+                    "siteIdentifier": "MIRN-1",
+                },
+            ],
+            "service_data": {
+                "950191": {
+                    "service": {"accountServiceId": 950191, "serviceType": "Power"},
+                    "usage_summary": {
+                        "registers": [
+                            {
+                                "slug": "e1_peak_usage",
+                                "suffix": "E1",
+                                "chargeType": "Peak",
+                                "direction": "import",
+                                "usage_class": "general_import",
+                                "register_sensor": True,
+                            },
+                            {
+                                "slug": "b1_feed_in",
+                                "suffix": "B1",
+                                "chargeType": "Solar",
+                                "direction": "export",
+                                "usage_class": "export",
+                                "register_sensor": True,
+                            },
+                            {
+                                "slug": "e1_general_usage",
+                                "suffix": "E1",
+                                "chargeType": None,
+                                "direction": "import",
+                                "usage_class": "general_import",
+                                "register_sensor": False,
+                            },
+                        ]
+                    },
+                },
+            },
+        }
+
+    return Coordinator()
+
+
+def test_options_flow_lists_rates_for_import_register_sensors() -> None:
+    """The options form shows one rate field per import register statistic."""
+    entry = config_entries.ConfigEntry(
+        options={"register_rates": {"950191:e1_peak_usage": 0.42}},
+        runtime_data=_rate_field_coordinator(),
+    )
+    flow = config_flow.GloBirdOptionsFlow()
+    flow.config_entry = entry
+
+    result = asyncio.run(flow.async_step_init())
+
+    assert result["type"] == "form"
+    schema = str(result["data_schema"])
+    assert "daily_poll_start_time" in schema
+    assert "register_rates" in schema
+    rates_key = next(
+        key
+        for key in result["data_schema"]
+        if getattr(key, "key", "") == "register_rates"
+    )
+    fields = result["data_schema"][rates_key].config["fields"]
+    # Only import registers flagged register_sensor get fields; the export
+    # register and the single flat-rate register do not.
+    assert set(fields) == {"950191:e1_peak_usage"}
+    peak = fields["950191:e1_peak_usage"]
+    assert peak["label"] == "E1 Peak rate (AUD/kWh)"
+    assert peak["default"] == 0.42
+
+
+def test_options_flow_merges_submitted_rates_over_stored() -> None:
+    """Submitted rates merge with stored ones so missing registers keep theirs."""
+    entry = config_entries.ConfigEntry(
+        options={
+            "register_rates": {
+                "950191:e1_peak_usage": 0.42,
+                "old_service:old_register": 9.99,
+            },
+        },
+        runtime_data=_rate_field_coordinator(),
+    )
+    flow = config_flow.GloBirdOptionsFlow()
+    flow.config_entry = entry
+
+    asyncio.run(flow.async_step_init())
+    result = asyncio.run(
+        flow.async_step_init(
+            {
+                "daily_poll_start_time": "00:05",
+                "register_rates": {"950191:e1_peak_usage": 0.55},
+            }
+        )
+    )
+
+    assert result["type"] == "create_entry"
+    assert result["data"]["register_rates"] == {
+        "950191:e1_peak_usage": 0.55,
+        "old_service:old_register": 9.99,
+    }
+
+
+def test_options_flow_ignores_invalid_rate_values() -> None:
+    """Non-numeric submitted rates are dropped instead of breaking the entry."""
+    flow = config_flow.GloBirdOptionsFlow()
+
+    result = asyncio.run(
+        flow.async_step_init(
+            {
+                "daily_poll_start_time": "00:05",
+                "register_rates": {"svc:r1": "not-a-number", "svc:r2": 0.25},
+            }
+        )
+    )
+
+    assert result["type"] == "create_entry"
+    assert result["data"]["register_rates"] == {"svc:r2": 0.25}
 
 
 def test_user_step_shows_initial_form() -> None:

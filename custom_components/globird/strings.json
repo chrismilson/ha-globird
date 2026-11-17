@@ -57,10 +57,12 @@
         "title": "GloBird options",
         "description": "Set when automatic daily readiness polling resumes after the previous day is ready.",
         "data": {
-          "daily_poll_start_time": "Daily polling start time"
+          "daily_poll_start_time": "Daily polling start time",
+          "register_rates": "Register rates"
         },
         "data_description": {
-          "daily_poll_start_time": "Local time of day when automatic polling resumes to check for yesterday's meter data."
+          "daily_poll_start_time": "Local time of day when automatic polling resumes to check for yesterday's meter data.",
+          "register_rates": "Optional AUD/kWh rate for each time-of-use register. When a register has a rate, the integration imports a daily cost statistic for it (and one for the usage total) that the Energy Dashboard can pair with that register's usage."
         }
       }
     }

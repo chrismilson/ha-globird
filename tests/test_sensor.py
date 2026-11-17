@@ -223,9 +223,15 @@ ZEROHERO_FIXTURE_PATH = (
 class FakeEntry:
     """Config entry stand-in that records unload callbacks."""
 
-    def __init__(self, entry_id: str = "entry-1", runtime_data: Any = None) -> None:
+    def __init__(
+        self,
+        entry_id: str = "entry-1",
+        runtime_data: Any = None,
+        options: dict[str, Any] | None = None,
+    ) -> None:
         self.entry_id = entry_id
         self.runtime_data = runtime_data
+        self.options: dict[str, Any] = options or {}
         self.unload_callbacks: list[Any] = []
         self.background_tasks: list[tuple[Any, str]] = []
 
@@ -1818,6 +1824,165 @@ def test_daily_upload_continues_when_window_moves(monkeypatch: Any) -> None:
     )
 
     assert [row["sum"] for row in uploaded[1][1]] == [5.0, 9.0]
+
+
+_PEAK_REGISTER = {
+    "key": "E1 Peak",
+    "slug": "e1_peak_usage",
+    "suffix": "E1",
+    "chargeType": "Peak",
+    "direction": "import",
+    "usage_class": "general_import",
+    "register_sensor": True,
+    "total": 5.0,
+    "daily": _DAILY,
+}
+
+_OFFPEAK_REGISTER = {
+    "key": "E1 Offpeak",
+    "slug": "e1_offpeak_usage",
+    "suffix": "E1",
+    "chargeType": "Offpeak",
+    "direction": "import",
+    "usage_class": "general_import",
+    "register_sensor": True,
+    "total": 3.0,
+    "daily": [
+        {"readDate": "2026/10/01", "usage": 1.0},
+        {"readDate": "2026/10/02", "usage": 2.0},
+    ],
+}
+
+
+def _register_coordinator(
+    registers: list[dict[str, Any]], daily: list[dict[str, Any]] | None = None
+) -> Any:
+    """Return a coordinator whose usage summary carries the given registers."""
+    return _UsageCoordinator(
+        {"daily": _DAILY if daily is None else daily, "registers": registers}
+    )
+
+
+def test_register_with_rate_imports_priced_cost_series(monkeypatch: Any) -> None:
+    """A register with a configured rate also imports an AUD cost series."""
+    uploaded, _queries = _install_recorder_stubs(monkeypatch, [])
+    entry = FakeEntry(options={"register_rates": {"1:e1_peak_usage": 0.5}})
+    register = dict(_PEAK_REGISTER)
+    register_sensor = sensor.GloBirdUsageRegisterSensor(
+        _register_coordinator([register]), entry, _POWER_SERVICE, register
+    )
+
+    asyncio.run(register_sensor._async_upload_statistics())
+
+    assert len(uploaded) == 2
+    usage_meta, usage_rows = uploaded[0]
+    assert usage_meta["statistic_id"] == (
+        "globird:entry_1_service_1_register_e1_peak_usage"
+    )
+    assert usage_meta["unit_of_measurement"] == sensor.UnitOfEnergy.KILO_WATT_HOUR
+    assert [row["sum"] for row in usage_rows] == [2.0, 5.0]
+    cost_meta, cost_rows = uploaded[1]
+    assert cost_meta["statistic_id"] == (
+        "globird:entry_1_service_1_register_e1_peak_usage_cost"
+    )
+    assert cost_meta["name"] == "Recent E1 Peak Cost"
+    assert cost_meta["unit_of_measurement"] == "AUD"
+    assert [row["state"] for row in cost_rows] == [1.0, 1.5]
+    assert [row["sum"] for row in cost_rows] == [1.0, 2.5]
+    attrs = register_sensor.extra_state_attributes
+    assert attrs["cost_rate"] == 0.5
+    assert attrs["cost_statistic_id"] == (
+        "globird:entry_1_service_1_register_e1_peak_usage_cost"
+    )
+
+
+def test_register_without_rate_imports_no_cost_series(monkeypatch: Any) -> None:
+    """Without a configured rate only the usage series is imported."""
+    uploaded, _queries = _install_recorder_stubs(monkeypatch, [])
+    register = dict(_PEAK_REGISTER)
+    register_sensor = sensor.GloBirdUsageRegisterSensor(
+        _register_coordinator([register]),
+        FakeEntry(),
+        _POWER_SERVICE,
+        register,
+    )
+
+    asyncio.run(register_sensor._async_upload_statistics())
+
+    assert len(uploaded) == 1
+    assert "cost_rate" not in register_sensor.extra_state_attributes
+
+
+def test_register_cost_series_ignores_invalid_rate_values(monkeypatch: Any) -> None:
+    """A stored rate that is not a number is treated as unconfigured."""
+    uploaded, _queries = _install_recorder_stubs(monkeypatch, [])
+    register = dict(_PEAK_REGISTER)
+    register_sensor = sensor.GloBirdUsageRegisterSensor(
+        _register_coordinator([register]),
+        FakeEntry(options={"register_rates": {"1:e1_peak_usage": "oops"}}),
+        _POWER_SERVICE,
+        register,
+    )
+
+    asyncio.run(register_sensor._async_upload_statistics())
+
+    assert len(uploaded) == 1
+
+
+def test_usage_total_imports_combined_cost_when_all_registers_priced(
+    monkeypatch: Any,
+) -> None:
+    """The usage total gets a TOU-aware cost series when every import register has a rate."""
+    uploaded, _queries = _install_recorder_stubs(monkeypatch, [])
+    entry = FakeEntry(
+        options={
+            "register_rates": {
+                "1:e1_peak_usage": 0.5,
+                "1:e1_offpeak_usage": 0.2,
+            }
+        }
+    )
+    usage_total = sensor.GloBirdUsageTotalSensor(
+        _register_coordinator([dict(_PEAK_REGISTER), dict(_OFFPEAK_REGISTER)]),
+        entry,
+        _POWER_SERVICE,
+    )
+
+    asyncio.run(usage_total._async_upload_statistics())
+
+    cost_uploads = [
+        item for item in uploaded if item[0]["statistic_id"].endswith("_cost")
+    ]
+    assert len(cost_uploads) == 1
+    metadata, rows = cost_uploads[0]
+    assert metadata["statistic_id"] == "globird:entry_1_service_1_usage_total_cost"
+    assert metadata["name"] == "Recent Usage Total Cost"
+    assert metadata["unit_of_measurement"] == "AUD"
+    assert [row["state"] for row in rows] == [1.2, 1.9]
+    assert [row["sum"] for row in rows] == [1.2, 3.1]
+    attrs = usage_total.extra_state_attributes
+    assert attrs["usage_cost_statistic_id"] == (
+        "globird:entry_1_service_1_usage_total_cost"
+    )
+
+
+def test_usage_total_skips_cost_when_a_register_is_unpriced(
+    monkeypatch: Any,
+) -> None:
+    """Without a rate for every import register no combined cost is imported."""
+    uploaded, _queries = _install_recorder_stubs(monkeypatch, [])
+    usage_total = sensor.GloBirdUsageTotalSensor(
+        _register_coordinator([dict(_PEAK_REGISTER), dict(_OFFPEAK_REGISTER)]),
+        FakeEntry(options={"register_rates": {"1:e1_peak_usage": 0.5}}),
+        _POWER_SERVICE,
+    )
+
+    asyncio.run(usage_total._async_upload_statistics())
+
+    assert [item[0]["statistic_id"] for item in uploaded] == [
+        "globird:entry_1_service_1_usage_total"
+    ]
+    assert "usage_cost_statistic_id" not in usage_total.extra_state_attributes
 
 
 def _zerohero_usage_summary() -> dict[str, Any]:
