@@ -4,7 +4,7 @@ All notable changes to this project are documented in this file.
 
 This project uses Home Assistant's calendar versioning scheme (`YYYY.M.P`, for example `2026.10.0`).
 
-## [Unreleased]
+## [2026.11.1] - 2026-11-18
 
 ### Added
 
