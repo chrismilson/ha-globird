@@ -19,6 +19,7 @@ concurrency:
 
 jobs:
   validate-version:
+    timeout-minutes: 30
     name: Version
     runs-on: ubuntu-latest
     steps:
@@ -56,6 +57,7 @@ jobs:
           EOF
 
   validate-hacs:
+    timeout-minutes: 30
     name: HACS
     runs-on: ubuntu-latest
     steps:
@@ -68,6 +70,7 @@ jobs:
           category: integration
 
   release-zip:
+    timeout-minutes: 30
     name: Release zip
     runs-on: ubuntu-latest
     steps:
@@ -88,6 +91,7 @@ jobs:
           (cd dist/a && sha256sum -c SHA256SUMS)
 
   validate-hassfest:
+    timeout-minutes: 30
     name: Hassfest
     runs-on: ubuntu-latest
     steps:
