@@ -14,7 +14,9 @@ DEFAULT_DAILY_POLL_START_TIME = "00:05"
 # Options key holding {f"{service_id}:{register_slug}": rate} AUD/kWh rates for
 # registers that get their own usage statistic. Configured rates let the
 # integration import a per-register (and usage-total) daily cost statistic for
-# the Energy Dashboard, which cannot price external statistics itself.
+# the Energy Dashboard, which cannot price external statistics itself. The
+# options form shows and takes the rates in AUD-cents per kWh, the unit the
+# GloBird bill uses, and stores them converted to AUD/kWh.
 CONF_REGISTER_RATES = "register_rates"
 
 BASE_URL = "https://myaccount.globirdenergy.com.au"

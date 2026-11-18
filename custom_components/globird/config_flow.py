@@ -227,10 +227,17 @@ def _register_label(register: dict[str, Any]) -> str:
     return label or str(register.get("slug") or "register")
 
 
-RATE_FIELD_MIN = -100
-RATE_FIELD_MAX = 1000
-# Home Assistant's number selector rejects steps smaller than 0.001.
-RATE_FIELD_STEP = 0.001
+# Rates are stored in AUD/kWh (what the cost statistics use) but shown and
+# submitted in the options form in AUD-cents per kWh, the unit GloBird bills
+# in. Home Assistant's number selector rejects steps smaller than 0.001;
+# box-mode input is not rounded to the step, so exact values such as 21.89
+# can be entered.
+RATE_FIELD_MIN_AUD = 0
+RATE_FIELD_MAX_AUD = 1000
+RATE_FIELD_CENTS = 100
+RATE_FIELD_CENTS_MIN = RATE_FIELD_MIN_AUD * RATE_FIELD_CENTS
+RATE_FIELD_CENTS_MAX = RATE_FIELD_MAX_AUD * RATE_FIELD_CENTS
+RATE_FIELD_CENTS_STEP = 0.1
 
 
 class GloBirdOptionsFlow(config_entries.OptionsFlowWithReload):
@@ -295,20 +302,20 @@ class GloBirdOptionsFlow(config_entries.OptionsFlowWithReload):
                     label = f"{label} ({site})"
                 key = f"{sid}:{slug}"
                 field: dict[str, Any] = {
-                    "label": f"{label} rate (AUD/kWh)",
+                    "label": f"{label} rate (c/kWh)",
                     "selector": selector.NumberSelector(
                         selector.NumberSelectorConfig(
-                            min=RATE_FIELD_MIN,
-                            max=RATE_FIELD_MAX,
-                            step=RATE_FIELD_STEP,
-                            unit_of_measurement="AUD/kWh",
+                            min=RATE_FIELD_CENTS_MIN,
+                            max=RATE_FIELD_CENTS_MAX,
+                            step=RATE_FIELD_CENTS_STEP,
+                            unit_of_measurement="c/kWh",
                             mode=selector.NumberSelectorMode.BOX,
                         )
                     ),
                     "required": False,
                 }
                 if key in self._stored_rates:
-                    field["default"] = self._stored_rates[key]
+                    field["default"] = self._stored_rates[key] * RATE_FIELD_CENTS
                 fields[key] = field
         return fields
 
@@ -324,7 +331,9 @@ class GloBirdOptionsFlow(config_entries.OptionsFlowWithReload):
                     if not isinstance(key, str) or not key:
                         continue
                     try:
-                        rate = float(value)
+                        # Submitted in cents/kWh as billed; stored in AUD/kWh.
+                        # Rounded to shed float-division artifacts (35.6/100).
+                        rate = round(float(value) / RATE_FIELD_CENTS, 6)
                     except (TypeError, ValueError):
                         continue
                     self._stored_rates[key] = rate

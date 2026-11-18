@@ -4,6 +4,12 @@ All notable changes to this project are documented in this file.
 
 This project uses Home Assistant's calendar versioning scheme (`YYYY.M.P`, for example `2026.10.0`).
 
+## [2026.11.3] - 2026-11-18
+
+### Added
+
+- Register rates are now entered in **c/kWh**, the unit the GloBird bill uses, and stored as AUD/kWh. Exact bill prices such as 21.89 c/kWh no longer have to be rounded to 0.219 AUD/kWh; costs are computed in AUD as before. Rates configured in earlier releases keep working — reopening the options form shows them converted to cents.
+
 ## [2026.11.2] - 2026-11-18
 
 ### Fixed

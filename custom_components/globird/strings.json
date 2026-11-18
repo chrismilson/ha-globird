@@ -62,7 +62,7 @@
         },
         "data_description": {
           "daily_poll_start_time": "Local time of day when automatic polling resumes to check for yesterday's meter data.",
-          "register_rates": "Optional AUD/kWh rate for each time-of-use register. When a register has a rate, the integration imports a daily cost statistic for it (and one for the usage total) that the Energy Dashboard can pair with that register's usage."
+          "register_rates": "Optional cents/kWh rate for each time-of-use register, as billed. When a register has a rate, the integration imports a daily cost statistic for it (and one for the usage total) in AUD that the Energy Dashboard can pair with that register's usage."
         }
       }
     }

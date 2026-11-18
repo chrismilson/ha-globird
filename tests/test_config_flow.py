@@ -141,10 +141,10 @@ class TimeSelector:
 
 
 class NumberSelector:
-    """Minimal number selector."""
+    """Minimal number selector that keeps its configuration."""
 
-    def __init__(self, _config: Any) -> None:
-        return None
+    def __init__(self, config: Any) -> None:
+        self.config = config
 
 
 class ObjectSelector:
@@ -286,8 +286,10 @@ def _rate_field_coordinator() -> Any:
 
 def test_rate_selector_step_meets_home_assistant_minimum() -> None:
     """HA's number selector rejects steps below 0.001 (real-form 400 regression)."""
-    assert config_flow.RATE_FIELD_STEP == "any" or config_flow.RATE_FIELD_STEP >= 1e-3
-    assert config_flow.RATE_FIELD_MIN < config_flow.RATE_FIELD_MAX
+    assert config_flow.RATE_FIELD_CENTS_STEP == "any" or (
+        config_flow.RATE_FIELD_CENTS_STEP >= 1e-3
+    )
+    assert config_flow.RATE_FIELD_MIN_AUD < config_flow.RATE_FIELD_MAX_AUD
 
 
 def test_options_flow_lists_rates_for_import_register_sensors() -> None:
@@ -315,8 +317,10 @@ def test_options_flow_lists_rates_for_import_register_sensors() -> None:
     # register and the single flat-rate register do not.
     assert set(fields) == {"950191:e1_peak_usage"}
     peak = fields["950191:e1_peak_usage"]
-    assert peak["label"] == "E1 Peak rate (AUD/kWh)"
-    assert peak["default"] == 0.42
+    assert peak["label"] == "E1 Peak rate (c/kWh)"
+    # Stored AUD/kWh rates render as cents/kWh, the unit GloBird bills in.
+    assert peak["default"] == 42
+    assert peak["selector"].config["unit_of_measurement"] == "c/kWh"
 
 
 def test_options_flow_merges_submitted_rates_over_stored() -> None:
@@ -338,7 +342,8 @@ def test_options_flow_merges_submitted_rates_over_stored() -> None:
         flow.async_step_init(
             {
                 "daily_poll_start_time": "00:05",
-                "register_rates": {"950191:e1_peak_usage": 0.55},
+                # Submitted in cents/kWh; stored converted to AUD/kWh.
+                "register_rates": {"950191:e1_peak_usage": 55},
             }
         )
     )
@@ -358,7 +363,7 @@ def test_options_flow_ignores_invalid_rate_values() -> None:
         flow.async_step_init(
             {
                 "daily_poll_start_time": "00:05",
-                "register_rates": {"svc:r1": "not-a-number", "svc:r2": 0.25},
+                "register_rates": {"svc:r1": "not-a-number", "svc:r2": 25},
             }
         )
     )
