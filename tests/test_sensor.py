@@ -10,6 +10,7 @@ import sys
 import types
 from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
+from types import MappingProxyType
 from typing import Any
 
 import pytest
@@ -1897,6 +1898,23 @@ def test_register_with_rate_imports_priced_cost_series(monkeypatch: Any) -> None
     assert attrs["cost_statistic_id"] == (
         "globird:entry_1_service_1_register_e1_peak_usage_cost"
     )
+
+
+def test_register_rates_read_mapping_proxy_options() -> None:
+    """ConfigEntry.options is a Mapping, not a dict, in current core (#rates lost)."""
+    entry = FakeEntry(
+        options=MappingProxyType({"register_rates": {"1:e1_peak_usage": 21.89}})
+    )
+    usage_total = sensor.GloBirdUsageTotalSensor(
+        _register_coordinator([dict(_PEAK_REGISTER)]), entry, _POWER_SERVICE
+    )
+    register = dict(_PEAK_REGISTER)
+    register_sensor = sensor.GloBirdUsageRegisterSensor(
+        _register_coordinator([register]), entry, _POWER_SERVICE, register
+    )
+
+    assert usage_total._register_rate("e1_peak_usage") == 0.2189
+    assert register_sensor._register_rate("e1_peak_usage") == 0.2189
 
 
 def test_register_without_rate_imports_no_cost_series(monkeypatch: Any) -> None:

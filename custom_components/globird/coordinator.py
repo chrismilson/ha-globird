@@ -108,11 +108,10 @@ class GloBirdCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     @property
     def _daily_poll_start_time(self) -> dt_time:
         """Return the configured local time for the next day's readiness polling."""
-        options = getattr(self.entry, "options", {})
+        # ConfigEntry.options is a Mapping (not a dict) in current core.
+        options = getattr(self.entry, "options", None)
         configured = (
-            options.get(CONF_DAILY_POLL_START_TIME)
-            if isinstance(options, dict)
-            else None
+            options.get(CONF_DAILY_POLL_START_TIME) if options is not None else None
         )
         return _parse_daily_poll_start_time(configured)
 

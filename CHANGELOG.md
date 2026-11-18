@@ -4,6 +4,12 @@ All notable changes to this project are documented in this file.
 
 This project uses Home Assistant's calendar versioning scheme (`YYYY.M.P`, for example `2026.10.0`).
 
+## [2026.11.5] - 2026-11-18
+
+### Fixed
+
+- Register rates were saved but never applied: current Home Assistant stores config entry options as a Mapping rather than a dict, and the rate lookup rejected it with an `isinstance(options, dict)` check, so every cost-series import silently saw no rates. The lookup now accepts any Mapping. The same check in the coordinator's daily-poll-start-time option is fixed too.
+
 ## [2026.11.4] - 2026-11-18
 
 ### Added

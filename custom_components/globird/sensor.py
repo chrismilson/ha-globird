@@ -965,8 +965,12 @@ class GloBirdServiceBaseSensor(GloBirdBaseSensor):
 
     def _register_rates(self) -> dict[str, float]:
         """Return the configured per-register rates, in AUD-cents per kWh."""
+        # ConfigEntry.options is a Mapping (not a dict) in current core, so
+        # only rely on Mapping APIs here.
         options = getattr(self._config_entry, "options", None)
-        rates = options.get(CONF_REGISTER_RATES) if isinstance(options, dict) else None
+        if options is None:
+            return {}
+        rates = options.get(CONF_REGISTER_RATES)
         if not isinstance(rates, dict):
             return {}
         result: dict[str, float] = {}
