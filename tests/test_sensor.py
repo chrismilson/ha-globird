@@ -1856,12 +1856,17 @@ _OFFPEAK_REGISTER = {
 
 
 def _register_coordinator(
-    registers: list[dict[str, Any]], daily: list[dict[str, Any]] | None = None
+    registers: list[dict[str, Any]],
+    daily: list[dict[str, Any]] | None = None,
+    cost_summary: dict[str, Any] | None = None,
 ) -> Any:
     """Return a coordinator whose usage summary carries the given registers."""
-    return _UsageCoordinator(
+    coordinator = _UsageCoordinator(
         {"daily": _DAILY if daily is None else daily, "registers": registers}
     )
+    if cost_summary is not None:
+        coordinator.data["service_data"]["1"]["cost_summary"] = cost_summary
+    return coordinator
 
 
 def test_register_with_rate_imports_priced_cost_series(monkeypatch: Any) -> None:
@@ -2004,6 +2009,172 @@ def test_usage_total_skips_cost_when_a_register_is_unpriced(
         "globird:entry_1_service_1_usage_total"
     ]
     assert "usage_cost_statistic_id" not in usage_total.extra_state_attributes
+
+
+_TIME_SPLIT_SUPPLY = {
+    "daily": [
+        {
+            "date": "2026/10/01",
+            "amount": 1.14,
+            "chargeCategory": "SUPPLY",
+            "complete": True,
+        },
+        {
+            "date": "2026/10/02",
+            "amount": 1.14,
+            "chargeCategory": "SUPPLY",
+            "complete": True,
+        },
+        {
+            "date": "2026/10/03",
+            "amount": 1.14,
+            "chargeCategory": "SUPPLY",
+            "complete": True,
+        },
+        {
+            "date": "2026/10/01",
+            "amount": 4.23,
+            "chargeCategory": "USAGE",
+            "complete": True,
+        },
+        {
+            "date": "2026/10/02",
+            "amount": 2.9,
+            "chargeCategory": "SUPPLY",
+            "complete": False,
+        },
+    ],
+}
+
+_PEAK_WINDOW = dict(
+    _PEAK_REGISTER, time_periods=[{"start": "14:00", "end": "20:00"}]
+)  # 6h of 24h
+_OFFPEAK_WINDOW = dict(
+    _OFFPEAK_REGISTER, time_periods=[{"start": "20:00", "end": "14:00"}]
+)  # 18h, crossing midnight
+
+
+def test_register_tou_minutes() -> None:
+    """Window minutes handle normal, midnight-crossing and 24:00 ends."""
+    assert sensor._register_tou_minutes(_PEAK_WINDOW) == 360
+    assert sensor._register_tou_minutes(_OFFPEAK_WINDOW) == 1080
+    assert (
+        sensor._register_tou_minutes(
+            dict(_PEAK_REGISTER, time_periods=[{"start": "00:00", "end": "24:00"}])
+        )
+        == 1440
+    )
+    assert sensor._register_tou_minutes(dict(_PEAK_REGISTER, time_periods=[])) == 0
+    assert (
+        sensor._register_tou_minutes(
+            dict(_PEAK_REGISTER, time_periods=[{"start": None, "end": "20:00"}])
+        )
+        == 0
+    )
+
+
+def test_register_cost_with_supply_splits_by_window_minutes(monkeypatch: Any) -> None:
+    """Combined register costs add the supply charge split over window minutes."""
+    uploaded, _queries = _install_recorder_stubs(monkeypatch, [])
+    entry = FakeEntry(
+        options={"register_rates": {"1:e1_peak_usage": 50, "1:e1_offpeak_usage": 20}}
+    )
+    peak = sensor.GloBirdUsageRegisterSensor(
+        _register_coordinator(
+            [_PEAK_WINDOW, _OFFPEAK_WINDOW], cost_summary=_TIME_SPLIT_SUPPLY
+        ),
+        entry,
+        _POWER_SERVICE,
+        _PEAK_WINDOW,
+    )
+
+    asyncio.run(peak._async_upload_statistics())
+
+    assert len(uploaded) == 3
+    supply_meta, supply_rows = uploaded[2]
+    assert supply_meta["statistic_id"] == (
+        "globird:entry_1_service_1_register_e1_peak_usage_cost_with_supply"
+    )
+    assert supply_meta["name"] == "Recent E1 Peak Cost With Supply"
+    assert supply_meta["unit_of_measurement"] == "AUD"
+    # Plain cost (2 kWh x 0.50) + a quarter of each day's $1.14 supply.
+    # The supply-only 2026/10/03 still counts (no usage published yet).
+    assert [row["state"] for row in supply_rows] == [1.285, 1.785, 0.285]
+    assert "cost_with_supply_statistic_id" in peak.extra_state_attributes
+
+    offpeak = sensor.GloBirdUsageRegisterSensor(
+        _register_coordinator(
+            [_PEAK_WINDOW, _OFFPEAK_WINDOW], cost_summary=_TIME_SPLIT_SUPPLY
+        ),
+        entry,
+        _POWER_SERVICE,
+        _OFFPEAK_WINDOW,
+    )
+    uploaded.clear()
+    asyncio.run(offpeak._async_upload_statistics())
+    supply_meta, supply_rows = uploaded[2]
+    # Plain cost (2 kWh x 0.20) + three quarters of the supply charge.
+    assert [row["state"] for row in supply_rows] == [1.055, 1.255, 0.855]
+
+
+def test_usage_total_cost_with_supply_matches_bill_lines(monkeypatch: Any) -> None:
+    """The usage total with supply adds the whole daily supply charge."""
+    uploaded, _queries = _install_recorder_stubs(monkeypatch, [])
+    entry = FakeEntry(
+        options={"register_rates": {"1:e1_peak_usage": 50, "1:e1_offpeak_usage": 20}}
+    )
+    usage_total = sensor.GloBirdUsageTotalSensor(
+        _register_coordinator(
+            [_PEAK_WINDOW, _OFFPEAK_WINDOW], cost_summary=_TIME_SPLIT_SUPPLY
+        ),
+        entry,
+        _POWER_SERVICE,
+    )
+
+    asyncio.run(usage_total._async_upload_statistics())
+
+    combined = [
+        item
+        for item in uploaded
+        if item[0]["statistic_id"].endswith("_cost_with_supply")
+    ]
+    assert len(combined) == 1
+    metadata, rows = combined[0]
+    assert (
+        metadata["statistic_id"]
+        == "globird:entry_1_service_1_usage_total_cost_with_supply"
+    )
+    assert metadata["name"] == "Recent Usage Total Cost With Supply"
+    # Register costs (1.0 + 0.2 / 1.5 + 0.4) plus the full supply charge.
+    assert [row["state"] for row in rows] == [2.34, 3.04, 1.14]
+    attrs = usage_total.extra_state_attributes
+    assert attrs["usage_cost_with_supply_statistic_id"] == (
+        "globird:entry_1_service_1_usage_total_cost_with_supply"
+    )
+
+
+def test_cost_with_supply_skipped_without_supply_rows(monkeypatch: Any) -> None:
+    """Without SUPPLY rows in the cost data no with-supply series is imported."""
+    uploaded, _queries = _install_recorder_stubs(monkeypatch, [])
+    entry = FakeEntry(
+        options={"register_rates": {"1:e1_peak_usage": 50, "1:e1_offpeak_usage": 20}}
+    )
+    peak = sensor.GloBirdUsageRegisterSensor(
+        _register_coordinator(
+            [_PEAK_WINDOW, _OFFPEAK_WINDOW], cost_summary={"daily": []}
+        ),
+        entry,
+        _POWER_SERVICE,
+        _PEAK_WINDOW,
+    )
+
+    asyncio.run(peak._async_upload_statistics())
+
+    assert [item[0]["statistic_id"] for item in uploaded] == [
+        "globird:entry_1_service_1_register_e1_peak_usage",
+        "globird:entry_1_service_1_register_e1_peak_usage_cost",
+    ]
+    assert "cost_with_supply_statistic_id" not in peak.extra_state_attributes
 
 
 def _zerohero_usage_summary() -> dict[str, Any]:

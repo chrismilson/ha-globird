@@ -4,6 +4,12 @@ All notable changes to this project are documented in this file.
 
 This project uses Home Assistant's calendar versioning scheme (`YYYY.M.P`, for example `2026.10.0`).
 
+## [2026.11.6] - 2026-11-18
+
+### Added
+
+- Supply-charge-aware cost statistics. The portal bills one supply charge per day with no register split, so when every general-import register has a rate the integration imports `globird:<entry>_service_<id>_register_<register>_cost_with_supply` (the register's priced usage plus its time-of-use window's share of the daily supply charge, with shares normalised so they add up to the daily charge) and `globird:<entry>_service_<id>_usage_total_cost_with_supply` (priced usage plus the full daily supply charge). Their sums over a billing period match the bill's supply and usage lines; days without a published supply row are omitted, and other charge categories (solar or ZeroHero credits) are not included. The plain `_cost` statistics remain for marginal per-window costs.
+
 ## [2026.11.5] - 2026-11-18
 
 ### Fixed

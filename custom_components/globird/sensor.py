@@ -435,6 +435,36 @@ def _rebase_legacy_gas_rows(stored_rows: list[StatisticData]) -> list[StatisticD
     ]
 
 
+def _time_of_day_minutes(value: Any) -> int | None:
+    """Return ``HH:MM`` as minutes from midnight, or None when unparseable."""
+    if value is None:
+        return None
+    match = re.fullmatch(r"(\d{1,2}):(\d{2})", str(value).strip())
+    if match is None:
+        return None
+    return int(match.group(1)) * 60 + int(match.group(2))
+
+
+def _register_tou_minutes(register: dict[str, Any]) -> int:
+    """Return the minutes per day a register's time-of-use windows are active.
+
+    Windows that cross midnight (end earlier than they start) wrap; a
+    ``24:00`` end counts as midnight of the next day.
+    """
+    minutes = 0
+    for period in register.get("time_periods") or []:
+        if not isinstance(period, dict):
+            continue
+        start = _time_of_day_minutes(period.get("start"))
+        end = _time_of_day_minutes(period.get("end"))
+        if start is None or end is None:
+            continue
+        if end < start:
+            end += 24 * 60
+        minutes += end - start
+    return minutes
+
+
 def _build_daily_cumulative_statistics(
     daily_rows: list[dict[str, Any]],
     *,
@@ -987,6 +1017,93 @@ class GloBirdServiceBaseSensor(GloBirdBaseSensor):
         # Rates are configured in cents/kWh; round away float-division
         # artifacts (21.89 / 100) at the 1e-6 AUD level.
         return round(rate_cents / 100.0, 6)
+
+    def _general_import_registers(self) -> list[dict[str, Any]]:
+        """Return this service's general-import register summaries."""
+        summary = self._service_detail().get("usage_summary") or {}
+        return [
+            register
+            for register in summary.get("registers") or []
+            if isinstance(register, dict)
+            and register.get("usage_class") == USAGE_CLASS_GENERAL_IMPORT
+        ]
+
+    def _rates_complete_for(self, registers: list[dict[str, Any]]) -> bool:
+        """Return whether every of the given registers has a configured rate."""
+        return all(
+            self._register_rate(str(register.get("slug") or "")) is not None
+            for register in registers
+        )
+
+    def _supply_daily_amounts(self) -> dict[date, float]:
+        """Return the portal's daily supply charge, keyed by day.
+
+        Supply rows can be published before a day's usage rows, so a day
+        being present here does not mean its usage is published yet.
+        """
+        summary = self._service_detail().get("cost_summary") or {}
+        amounts: dict[date, float] = {}
+        for row in summary.get("daily") or []:
+            if not isinstance(row, dict):
+                continue
+            if str(row.get("chargeCategory") or "").strip().upper() != "SUPPLY":
+                continue
+            if row.get("complete") is False:
+                continue
+            day = _parse_portal_day(row.get("date"))
+            amount = row.get("amount")
+            if day is None or not isinstance(amount, (int, float)):
+                continue
+            amounts[day] = amounts.get(day, 0.0) + float(amount)
+        return amounts
+
+    def _register_supply_shares(self) -> dict[str, float] | None:
+        """Return each priced general-import register's share of the daily supply charge.
+
+        The portal bills one supply charge per day with no register split,
+        so shares are a register's time-of-use window minutes over the
+        total across priced general-import registers; the shares add up to
+        the daily charge. None when the registers are unpriced or no
+        time-of-use windows are known.
+        """
+        registers = self._general_import_registers()
+        if not registers or not self._rates_complete_for(registers):
+            return None
+        minutes = {
+            str(register.get("slug") or ""): _register_tou_minutes(register)
+            for register in registers
+        }
+        total = sum(minutes.values())
+        if total <= 0:
+            return None
+        return {slug: value / total for slug, value in minutes.items()}
+
+    def _priced_daily_usage_costs(self) -> dict[date, float] | None:
+        """Return each day's priced import cost, keyed by day.
+
+        Sums the same rounded amounts the per-register cost statistics
+        store, so the usage-total series always equals their sum. None
+        when any general-import register lacks a rate.
+        """
+        registers = self._general_import_registers()
+        if not registers or not self._rates_complete_for(registers):
+            return None
+        daily_cost: dict[date, float] = {}
+        for register in registers:
+            rate = self._register_rate(str(register.get("slug") or ""))
+            if rate is None:
+                return None
+            for row in register.get("daily") or []:
+                if not isinstance(row, dict):
+                    continue
+                day = _parse_portal_day(row.get("readDate"))
+                usage = row.get("usage")
+                if day is None or not isinstance(usage, (int, float)):
+                    continue
+                daily_cost[day] = daily_cost.get(day, 0.0) + round(
+                    rate * float(usage), 3
+                )
+        return daily_cost
 
     def _service_attrs(self) -> dict[str, Any]:
         """Return service metadata attributes."""
@@ -1711,21 +1828,13 @@ class GloBirdUsageTotalSensor(GloBirdDailyStatisticsSensor):
             unit_class=EnergyConverter.UNIT_CLASS,
         )
         await self._async_upload_usage_cost_statistics()
+        await self._async_upload_usage_cost_with_supply_statistics()
         await self._async_upload_tracking_registers("import")
 
     def _usage_rates_complete(self) -> bool:
         """Return whether every general-import register has a configured rate."""
-        summary = self._service_detail().get("usage_summary") or {}
-        registers = [
-            register
-            for register in summary.get("registers") or []
-            if isinstance(register, dict)
-            and register.get("usage_class") == USAGE_CLASS_GENERAL_IMPORT
-        ]
-        return bool(registers) and all(
-            self._register_rate(str(register.get("slug") or "")) is not None
-            for register in registers
-        )
+        registers = self._general_import_registers()
+        return bool(registers) and self._rates_complete_for(registers)
 
     async def _async_upload_usage_cost_statistics(self) -> None:
         """Import a time-of-use-aware daily cost series for the usage total.
@@ -1736,34 +1845,11 @@ class GloBirdUsageTotalSensor(GloBirdDailyStatisticsSensor):
         general-import register; otherwise nothing is imported and any
         previously stored series is left as-is.
         """
-        if not self._usage_rates_complete():
-            return
-        summary = self._service_detail().get("usage_summary") or {}
-        daily_cost: dict[str, float] = {}
-        for register in summary.get("registers") or []:
-            if not isinstance(register, dict) or (
-                register.get("usage_class") != USAGE_CLASS_GENERAL_IMPORT
-            ):
-                continue
-            rate = self._register_rate(str(register.get("slug") or ""))
-            if rate is None:
-                continue
-            for row in register.get("daily") or []:
-                if not isinstance(row, dict):
-                    continue
-                day = row.get("readDate")
-                usage = row.get("usage")
-                if not isinstance(day, str) or not isinstance(usage, (int, float)):
-                    continue
-                # Sum the same rounded amounts the register series stores so
-                # the combined total always equals the register costs' sum.
-                daily_cost[day] = daily_cost.get(day, 0.0) + round(
-                    rate * float(usage), 3
-                )
+        daily_cost = self._priced_daily_usage_costs()
         if not daily_cost:
             return
         priced_rows = [
-            {"readDate": day, "amount": round(amount, 3)}
+            {"readDate": day.isoformat(), "amount": round(amount, 3)}
             for day, amount in sorted(daily_cost.items())
         ]
         await self._async_upload_daily_external_statistics(
@@ -1773,6 +1859,37 @@ class GloBirdUsageTotalSensor(GloBirdDailyStatisticsSensor):
             unit_class=None,
             statistic_id=f"{self._external_statistic_id()}_cost",
             name=f"{self._attr_name} Cost",
+            unit_of_measurement=CURRENCY_AUD,
+        )
+
+    async def _async_upload_usage_cost_with_supply_statistics(self) -> None:
+        """Import the usage-total cost with the daily supply charge added.
+
+        Each day is the priced usage cost plus the portal's supply charge
+        for that day, so the sum over a billing period matches the bill's
+        supply and usage lines. Days the portal has not published a
+        complete supply row for are left out.
+        """
+        daily_cost = self._priced_daily_usage_costs()
+        if not daily_cost:
+            return
+        supply = self._supply_daily_amounts()
+        if not supply:
+            return
+        rows = [
+            {
+                "readDate": day.isoformat(),
+                "amount": round(daily_cost.get(day, 0.0), 3) + round(amount, 3),
+            }
+            for day, amount in sorted(supply.items())
+        ]
+        await self._async_upload_daily_external_statistics(
+            rows,
+            date_key="readDate",
+            value_key="amount",
+            unit_class=None,
+            statistic_id=f"{self._external_statistic_id()}_cost_with_supply",
+            name=f"{self._attr_name} Cost With Supply",
             unit_of_measurement=CURRENCY_AUD,
         )
 
@@ -1792,6 +1909,10 @@ class GloBirdUsageTotalSensor(GloBirdDailyStatisticsSensor):
         attrs["register_statistics"] = self._register_statistics("import")
         if self._usage_rates_complete():
             attrs["usage_cost_statistic_id"] = f"{self._external_statistic_id()}_cost"
+            if self._supply_daily_amounts():
+                attrs["usage_cost_with_supply_statistic_id"] = (
+                    f"{self._external_statistic_id()}_cost_with_supply"
+                )
         return attrs
 
 
@@ -2057,6 +2178,56 @@ class GloBirdUsageRegisterSensor(GloBirdDailyStatisticsSensor):
             rate=rate,
             unit_of_measurement=CURRENCY_AUD,
         )
+        await self._async_upload_cost_with_supply_statistics(register, rate)
+
+    async def _async_upload_cost_with_supply_statistics(
+        self, register: dict[str, Any], rate: float
+    ) -> None:
+        """Import this register's cost with its share of the daily supply charge.
+
+        The portal bills one supply charge per day with no register split,
+        so the split is this register's time-of-use window minutes over the
+        total across priced general-import registers; the shares add up to
+        the daily supply charge. Days the portal has not published a
+        complete supply row for are left out, so period sums match the
+        bill's supply and usage lines. Requires a rate for every
+        general-import register.
+        """
+        shares = self._register_supply_shares()
+        if shares is None:
+            return
+        share = shares.get(self._slug)
+        if share is None:
+            return
+        supply = self._supply_daily_amounts()
+        if not supply:
+            return
+        usage_by_day: dict[date, float] = {}
+        for row in register.get("daily") or []:
+            if not isinstance(row, dict):
+                continue
+            day = _parse_portal_day(row.get("readDate"))
+            usage = row.get("usage")
+            if day is None or not isinstance(usage, (int, float)):
+                continue
+            usage_by_day[day] = usage_by_day.get(day, 0.0) + float(usage)
+        rows = [
+            {
+                "readDate": day.isoformat(),
+                "amount": round(rate * usage_by_day.get(day, 0.0), 3)
+                + round(amount * share, 3),
+            }
+            for day, amount in sorted(supply.items())
+        ]
+        await self._async_upload_daily_external_statistics(
+            rows,
+            date_key="readDate",
+            value_key="amount",
+            unit_class=None,
+            statistic_id=f"{self._external_statistic_id()}_cost_with_supply",
+            name=f"{self._attr_name} Cost With Supply",
+            unit_of_measurement=CURRENCY_AUD,
+        )
 
     @property
     def native_value(self) -> Any:
@@ -2090,6 +2261,13 @@ class GloBirdUsageRegisterSensor(GloBirdDailyStatisticsSensor):
         if rate is not None:
             attrs["cost_rate"] = rate
             attrs["cost_statistic_id"] = f"{self._external_statistic_id()}_cost"
+            if (
+                self._register_supply_shares() is not None
+                and self._supply_daily_amounts()
+            ):
+                attrs["cost_with_supply_statistic_id"] = (
+                    f"{self._external_statistic_id()}_cost_with_supply"
+                )
         return attrs
 
 
