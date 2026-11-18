@@ -4,6 +4,12 @@ All notable changes to this project are documented in this file.
 
 This project uses Home Assistant's calendar versioning scheme (`YYYY.M.P`, for example `2026.10.0`).
 
+## [2026.11.2] - 2026-11-18
+
+### Fixed
+
+- Opening the entry options (Configure) returned an error because the rate selector's step of 0.0001 is below the 0.001 minimum Home Assistant accepts for number selectors. The step is now 0.001 (0.1 cent).
+
 ## [2026.11.1] - 2026-11-18
 
 ### Added

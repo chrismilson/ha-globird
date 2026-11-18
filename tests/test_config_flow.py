@@ -284,6 +284,12 @@ def _rate_field_coordinator() -> Any:
     return Coordinator()
 
 
+def test_rate_selector_step_meets_home_assistant_minimum() -> None:
+    """HA's number selector rejects steps below 0.001 (real-form 400 regression)."""
+    assert config_flow.RATE_FIELD_STEP == "any" or config_flow.RATE_FIELD_STEP >= 1e-3
+    assert config_flow.RATE_FIELD_MIN < config_flow.RATE_FIELD_MAX
+
+
 def test_options_flow_lists_rates_for_import_register_sensors() -> None:
     """The options form shows one rate field per import register statistic."""
     entry = config_entries.ConfigEntry(

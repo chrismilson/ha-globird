@@ -227,6 +227,12 @@ def _register_label(register: dict[str, Any]) -> str:
     return label or str(register.get("slug") or "register")
 
 
+RATE_FIELD_MIN = -100
+RATE_FIELD_MAX = 1000
+# Home Assistant's number selector rejects steps smaller than 0.001.
+RATE_FIELD_STEP = 0.001
+
+
 class GloBirdOptionsFlow(config_entries.OptionsFlowWithReload):
     """Handle GloBird options."""
 
@@ -292,9 +298,9 @@ class GloBirdOptionsFlow(config_entries.OptionsFlowWithReload):
                     "label": f"{label} rate (AUD/kWh)",
                     "selector": selector.NumberSelector(
                         selector.NumberSelectorConfig(
-                            min=-100,
-                            max=1000,
-                            step=0.0001,
+                            min=RATE_FIELD_MIN,
+                            max=RATE_FIELD_MAX,
+                            step=RATE_FIELD_STEP,
                             unit_of_measurement="AUD/kWh",
                             mode=selector.NumberSelectorMode.BOX,
                         )
