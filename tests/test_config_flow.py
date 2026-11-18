@@ -286,16 +286,14 @@ def _rate_field_coordinator() -> Any:
 
 def test_rate_selector_step_meets_home_assistant_minimum() -> None:
     """HA's number selector rejects steps below 0.001 (real-form 400 regression)."""
-    assert config_flow.RATE_FIELD_CENTS_STEP == "any" or (
-        config_flow.RATE_FIELD_CENTS_STEP >= 1e-3
-    )
-    assert config_flow.RATE_FIELD_MIN_AUD < config_flow.RATE_FIELD_MAX_AUD
+    assert config_flow.RATE_FIELD_STEP == "any" or config_flow.RATE_FIELD_STEP >= 1e-3
+    assert config_flow.RATE_FIELD_MIN < config_flow.RATE_FIELD_MAX
 
 
 def test_options_flow_lists_rates_for_import_register_sensors() -> None:
     """The options form shows one rate field per import register statistic."""
     entry = config_entries.ConfigEntry(
-        options={"register_rates": {"950191:e1_peak_usage": 0.42}},
+        options={"register_rates": {"950191:e1_peak_usage": 42}},
         runtime_data=_rate_field_coordinator(),
     )
     flow = config_flow.GloBirdOptionsFlow()
@@ -318,9 +316,11 @@ def test_options_flow_lists_rates_for_import_register_sensors() -> None:
     assert set(fields) == {"950191:e1_peak_usage"}
     peak = fields["950191:e1_peak_usage"]
     assert peak["label"] == "E1 Peak rate (c/kWh)"
-    # Stored AUD/kWh rates render as cents/kWh, the unit GloBird bills in.
+    # Rates are stored in c/kWh and shown as entered.
     assert peak["default"] == 42
-    assert peak["selector"].config["unit_of_measurement"] == "c/kWh"
+    selector_config = peak["selector"].config
+    assert selector_config["unit_of_measurement"] == "c/kWh"
+    assert selector_config["step"] == 0.001
 
 
 def test_options_flow_merges_submitted_rates_over_stored() -> None:
@@ -328,8 +328,8 @@ def test_options_flow_merges_submitted_rates_over_stored() -> None:
     entry = config_entries.ConfigEntry(
         options={
             "register_rates": {
-                "950191:e1_peak_usage": 0.42,
-                "old_service:old_register": 9.99,
+                "950191:e1_peak_usage": 42,
+                "old_service:old_register": 999,
             },
         },
         runtime_data=_rate_field_coordinator(),
@@ -342,16 +342,16 @@ def test_options_flow_merges_submitted_rates_over_stored() -> None:
         flow.async_step_init(
             {
                 "daily_poll_start_time": "00:05",
-                # Submitted in cents/kWh; stored converted to AUD/kWh.
-                "register_rates": {"950191:e1_peak_usage": 55},
+                # Submitted and stored as cents/kWh, exact bill precision.
+                "register_rates": {"950191:e1_peak_usage": 21.89},
             }
         )
     )
 
     assert result["type"] == "create_entry"
     assert result["data"]["register_rates"] == {
-        "950191:e1_peak_usage": 0.55,
-        "old_service:old_register": 9.99,
+        "950191:e1_peak_usage": 21.89,
+        "old_service:old_register": 999,
     }
 
 
@@ -369,7 +369,7 @@ def test_options_flow_ignores_invalid_rate_values() -> None:
     )
 
     assert result["type"] == "create_entry"
-    assert result["data"]["register_rates"] == {"svc:r2": 0.25}
+    assert result["data"]["register_rates"] == {"svc:r2": 25}
 
 
 def test_user_step_shows_initial_form() -> None:

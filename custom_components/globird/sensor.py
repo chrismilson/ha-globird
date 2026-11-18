@@ -964,7 +964,7 @@ class GloBirdServiceBaseSensor(GloBirdBaseSensor):
         return detail if isinstance(detail, dict) else {}
 
     def _register_rates(self) -> dict[str, float]:
-        """Return the configured per-register rates keyed by ``service_id:slug``."""
+        """Return the configured per-register rates, in AUD-cents per kWh."""
         options = getattr(self._config_entry, "options", None)
         rates = options.get(CONF_REGISTER_RATES) if isinstance(options, dict) else None
         if not isinstance(rates, dict):
@@ -976,8 +976,13 @@ class GloBirdServiceBaseSensor(GloBirdBaseSensor):
         return result
 
     def _register_rate(self, slug: str) -> float | None:
-        """Return the configured AUD/kWh rate for one of this service's registers."""
-        return self._register_rates().get(f"{self._service_id}:{slug}")
+        """Return the configured rate for one register, converted to AUD/kWh."""
+        rate_cents = self._register_rates().get(f"{self._service_id}:{slug}")
+        if rate_cents is None:
+            return None
+        # Rates are configured in cents/kWh; round away float-division
+        # artifacts (21.89 / 100) at the 1e-6 AUD level.
+        return round(rate_cents / 100.0, 6)
 
     def _service_attrs(self) -> dict[str, Any]:
         """Return service metadata attributes."""

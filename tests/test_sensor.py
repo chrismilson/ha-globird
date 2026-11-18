@@ -1866,11 +1866,14 @@ def _register_coordinator(
 def test_register_with_rate_imports_priced_cost_series(monkeypatch: Any) -> None:
     """A register with a configured rate also imports an AUD cost series."""
     uploaded, _queries = _install_recorder_stubs(monkeypatch, [])
-    entry = FakeEntry(options={"register_rates": {"1:e1_peak_usage": 0.5}})
+    entry = FakeEntry(options={"register_rates": {"1:e1_peak_usage": 50}})
     register = dict(_PEAK_REGISTER)
     register_sensor = sensor.GloBirdUsageRegisterSensor(
         _register_coordinator([register]), entry, _POWER_SERVICE, register
     )
+
+    # Configured cents/kWh convert to AUD/kWh for pricing.
+    assert register_sensor._register_rate("e1_peak_usage") == 0.5
 
     asyncio.run(register_sensor._async_upload_statistics())
 
@@ -1937,8 +1940,8 @@ def test_usage_total_imports_combined_cost_when_all_registers_priced(
     entry = FakeEntry(
         options={
             "register_rates": {
-                "1:e1_peak_usage": 0.5,
-                "1:e1_offpeak_usage": 0.2,
+                "1:e1_peak_usage": 50,
+                "1:e1_offpeak_usage": 20,
             }
         }
     )
@@ -1973,7 +1976,7 @@ def test_usage_total_skips_cost_when_a_register_is_unpriced(
     uploaded, _queries = _install_recorder_stubs(monkeypatch, [])
     usage_total = sensor.GloBirdUsageTotalSensor(
         _register_coordinator([dict(_PEAK_REGISTER), dict(_OFFPEAK_REGISTER)]),
-        FakeEntry(options={"register_rates": {"1:e1_peak_usage": 0.5}}),
+        FakeEntry(options={"register_rates": {"1:e1_peak_usage": 50}}),
         _POWER_SERVICE,
     )
 

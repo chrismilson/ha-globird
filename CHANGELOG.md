@@ -4,6 +4,16 @@ All notable changes to this project are documented in this file.
 
 This project uses Home Assistant's calendar versioning scheme (`YYYY.M.P`, for example `2026.10.0`).
 
+## [2026.11.4] - 2026-11-18
+
+### Added
+
+- Register rates are stored and configured in c/kWh with a 0.001 step, so exact bill prices such as 21.89 — or finer, like 21.001 — no longer snap to a coarser step. The cost statistics convert the rate to AUD/kWh (dividing by 100) when they are priced.
+
+### Changed
+
+- Rates configured under 2026.11.3 were stored in AUD/kWh and are now interpreted as c/kWh; re-enter the rates once after updating (for example 21.89 for what was stored as 0.2189).
+
 ## [2026.11.3] - 2026-11-18
 
 ### Added
